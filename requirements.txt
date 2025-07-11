@@ -1,0 +1,29 @@
+# Core dependencies
+python-dotenv==1.0.0
+psycopg2-binary==2.9.7
+requests==2.31.0
+
+# Bitcoin-specific libraries
+python-bitcoinrpc==1.0
+bitcoin==1.1.42
+
+# Database and utilities
+sqlalchemy==2.0.21
+alembic==1.12.0
+
+# Progress tracking and logging
+tqdm==4.66.1
+colorama==0.4.6
+
+# Data processing
+pandas==2.1.1
+numpy==1.24.3
+
+# Testing
+pytest==7.4.2
+pytest-cov==4.1.0
+
+# Development tools
+black==23.9.1
+flake8==6.1.0
+mypy==1.5.1 
