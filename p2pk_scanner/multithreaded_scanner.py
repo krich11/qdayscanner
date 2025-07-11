@@ -277,6 +277,7 @@ def main():
     total_blocks_to_scan = end_block - start_block + 1
     last_report = 0
     report_interval = 10  # seconds
+    status_reporting = False  # Initialize status_reporting variable
     while True:
         # Refill the queue if needed (unless stop_event is set or all blocks queued)
         while not stop_event.is_set() and block_queue.qsize() < max_queue_depth and next_block <= end_block:
