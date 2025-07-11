@@ -19,6 +19,7 @@ qdayscanner/
 ├── p2pkh_exposure/        # P2PKH public key exposure tracking
 ├── quantum_analysis/      # Quantum vulnerability analysis
 ├── reporting/             # Reporting and visualization tools
+├── btcnow/               # Bitcoin price monitoring service
 └── utils/                 # Shared utilities and database schemas
 ```
 
@@ -110,11 +111,29 @@ cd p2pkh_exposure
 python scanner.py
 ```
 
+### BTCNow - Bitcoin Price Monitor
+
+A lightweight service that fetches current Bitcoin prices and saves them to `/tmp/.btcnow`:
+
+```bash
+cd btcnow
+./install.sh          # Install dependencies and setup
+./setup.sh            # Configure cron job for automatic updates
+cat /tmp/.btcnow      # Check current price
+```
+
+**Features:**
+- Fetches real-time Bitcoin price from CoinGecko API
+- Configurable cron job scheduling (5min to daily)
+- JSON output with timestamp and formatted price
+- Easy installation and management scripts
+
 ## Project Status
 
 - [x] Repository setup and documentation
 - [x] Environment configuration
-- [ ] P2PK scanner implementation
+- [x] P2PK scanner implementation
+- [x] BTCNow price monitoring service
 - [ ] P2PKH exposure scanner
 - [ ] Quantum vulnerability analysis
 - [ ] Reporting and visualization tools
