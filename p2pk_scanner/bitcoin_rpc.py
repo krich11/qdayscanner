@@ -9,6 +9,7 @@ import requests
 import time
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from requests.adapters import HTTPAdapter
 
 from utils.config import config
 
@@ -23,6 +24,9 @@ class BitcoinRPC:
         self.port = config.BITCOIN_RPC_PORT
         self.cookie_path = config.BITCOIN_RPC_COOKIE_PATH
         self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=128, pool_maxsize=128)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
         
         # Load RPC credentials from cookie file
         self._load_credentials()
@@ -96,19 +100,30 @@ class BitcoinRPC:
     
     def get_block_count(self) -> int:
         """Get the current block count."""
-        return self._make_request('getblockcount')
+        result = self._make_request('getblockcount')
+        if isinstance(result, int):
+            return result
+        raise Exception("get_block_count did not return an int")
     
     def get_block_hash(self, height: int) -> str:
         """Get block hash by height."""
-        return self._make_request('getblockhash', [height])
+        result = self._make_request('getblockhash', [height])
+        if isinstance(result, str):
+            return result
+        raise Exception("get_block_hash did not return a str")
     
     def get_block(self, block_hash: str, verbosity: int = 2) -> Dict[str, Any]:
         """Get block information by hash."""
-        return self._make_request('getblock', [block_hash, verbosity])
+        result = self._make_request('getblock', [block_hash, verbosity])
+        if isinstance(result, dict):
+            return result
+        raise Exception("get_block did not return a dict")
     
     def get_block_by_height(self, height: int, verbosity: int = 2) -> Dict[str, Any]:
         """Get block information by height."""
         block_hash = self.get_block_hash(height)
+        if block_hash is None:
+            raise Exception(f"get_block_hash returned None for height {height}")
         return self.get_block(block_hash, verbosity)
     
     def get_raw_transaction(self, txid: str, verbose: bool = True, block_hash: str = None) -> Dict[str, Any]:
@@ -116,7 +131,10 @@ class BitcoinRPC:
         params = [txid, verbose]
         if block_hash:
             params.append(block_hash)
-        return self._make_request('getrawtransaction', params)
+        result = self._make_request('getrawtransaction', params)
+        if isinstance(result, dict):
+            return result
+        raise Exception("get_raw_transaction did not return a dict")
     
     def test_connection(self) -> bool:
         """Test RPC connection to Bitcoin Core."""

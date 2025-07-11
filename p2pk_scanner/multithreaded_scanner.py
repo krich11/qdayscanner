@@ -45,6 +45,47 @@ total_blocks_scanned = 0
 blocks_scanned_lock = threading.Lock()
 
 
+def ensure_scan_progress_row(db_manager):
+    """Ensure the scan_progress row for the multithreaded scanner exists."""
+    try:
+        query = "SELECT 1 FROM scan_progress WHERE scanner_name = %s"
+        result = db_manager.execute_query(query, ('multithreaded_p2pk_scanner',))
+        if not result:
+            # Insert initial row
+            insert_query = """
+            INSERT INTO scan_progress (scanner_name, last_scanned_block, total_blocks_scanned, last_updated)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            """
+            db_manager.execute_command(insert_query, ('multithreaded_p2pk_scanner', 0, 0))
+            logger.info("Created scan_progress row for multithreaded_p2pk_scanner.")
+    except Exception as e:
+        logger.error(f"Error ensuring scan_progress row: {e}")
+
+
+def get_scan_progress(db_manager) -> int:
+    """Get the last scanned block height for multithreaded scanner."""
+    try:
+        query = "SELECT last_scanned_block FROM scan_progress WHERE scanner_name = %s"
+        result = db_manager.execute_query(query, ('multithreaded_p2pk_scanner',))
+        return result[0]['last_scanned_block'] if result else 0
+    except Exception as e:
+        logger.error(f"Error getting scan progress: {e}")
+        return 0
+
+
+def update_scan_progress(db_manager, block_height: int, blocks_scanned: int = 1):
+    """Update the scan progress for multithreaded scanner."""
+    try:
+        query = """
+        UPDATE scan_progress 
+        SET last_scanned_block = %s, total_blocks_scanned = total_blocks_scanned + %s, last_updated = CURRENT_TIMESTAMP
+        WHERE scanner_name = %s
+        """
+        db_manager.execute_command(query, (block_height, blocks_scanned, 'multithreaded_p2pk_scanner'))
+    except Exception as e:
+        logger.error(f"Error updating scan progress: {e}")
+
+
 def is_p2pk_script(script_pub_key: Dict[str, Any]) -> Optional[str]:
     try:
         if script_pub_key.get('type') == 'pubkey':
@@ -232,6 +273,7 @@ def main():
     parser.add_argument('--end-block', type=int, help='Block height to stop scanning at')
     parser.add_argument('--threads', type=int, default=8, help='Number of threads (default: 8)')
     parser.add_argument('--batch-size', type=int, default=100, help='Batch size for queue fill (default: 100)')
+    parser.add_argument('--reset', action='store_true', help='Reset scan progress and start from beginning')
     args = parser.parse_args()
 
     logger.info("Starting Multithreaded P2PK scanner...")
@@ -239,76 +281,131 @@ def main():
         logger.error("Failed to connect to Bitcoin Core")
         return
 
-    # Get blockchain height
-    blockchain_info = bitcoin_rpc.get_blockchain_info()
-    current_height = blockchain_info['blocks']
-    logger.info(f"Current blockchain height: {current_height}")
+    # Main thread keeps its DB connection open
+    db_manager = DatabaseManager()
+    try:
+        # Ensure scan_progress row exists
+        ensure_scan_progress_row(db_manager)
 
-    start_block = args.start_block if args.start_block is not None else 0
-    end_block = args.end_block if args.end_block is not None else current_height
-    threads = args.threads
-    batch_size = args.batch_size
+        # Get blockchain height
+        blockchain_info = bitcoin_rpc.get_blockchain_info()
+        current_height = blockchain_info['blocks']
+        logger.info(f"Current blockchain height: {current_height}")
 
-    logger.info(f"Scanning blocks {start_block} to {end_block} using {threads} threads (queue fill batch size: {batch_size})")
-    total_found = 0
-    start_time = time.time()
+        # Determine scan range with resume functionality
+        if args.reset:
+            start_block = args.start_block if args.start_block is not None else 0
+            logger.info(f"Reset requested. Starting from block {start_block}")
+        elif args.start_block is not None:
+            start_block = args.start_block
+            logger.info(f"Starting from specified block {start_block}")
+        else:
+            start_block = get_scan_progress(db_manager)
+            logger.info(f"Resuming from block {start_block}")
 
-    # Start keyboard listener thread
-    kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
-    kb_thread.start()
+        end_block = args.end_block if args.end_block is not None else current_height
+        threads = args.threads
+        batch_size = args.batch_size
 
-    block_queue = queue.Queue()
-    next_block = start_block
-    max_queue_depth = threads * 2
+        if start_block >= end_block:
+            logger.info("Already up to date")
+            return
 
-    # Fill the queue initially
-    for _ in range(min(max_queue_depth, end_block - start_block + 1)):
-        block_queue.put(next_block)
-        next_block += 1
+        logger.info(f"Scanning blocks {start_block} to {end_block} using {threads} threads (queue fill batch size: {batch_size})")
+        total_found = 0
+        start_time = time.time()
 
-    worker_threads = []
-    for i in range(threads):
-        tname = f"worker-{i}"
-        t = threading.Thread(target=worker, args=(block_queue, tname), daemon=True)
-        worker_threads.append(t)
-        t.start()
+        # Start keyboard listener thread
+        kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
+        kb_thread.start()
 
-    # --- Main loop: refill queue and handle shutdown ---
-    total_blocks_to_scan = end_block - start_block + 1
-    last_report = 0
-    report_interval = 10  # seconds
-    status_reporting = False  # Initialize status_reporting variable
-    while True:
-        # Refill the queue if needed (unless stop_event is set or all blocks queued)
-        while not stop_event.is_set() and block_queue.qsize() < max_queue_depth and next_block <= end_block:
+        block_queue = queue.Queue()
+        next_block = start_block
+        max_queue_depth = threads * 2
+
+        # Fill the queue initially
+        for _ in range(min(max_queue_depth, end_block - start_block + 1)):
             block_queue.put(next_block)
             next_block += 1
-        # Check if all workers are done and queue is empty
-        all_workers_done = not any(t.is_alive() for t in worker_threads)
-        queue_empty = block_queue.empty()
-        if stop_event.is_set():
-            status_reporting = True
-        if all_workers_done and queue_empty:
-            break
-        # Always report progress every report_interval seconds
-        if time.time() - last_report > report_interval:
-            with blocks_scanned_lock:
-                scanned = total_blocks_scanned
-            logger.info(f"Progress: {scanned}/{total_blocks_to_scan} blocks scanned.")
-            if status_reporting:
-                report_thread_status()
-                logger.info(f"Queue size: {block_queue.qsize()}")
-            last_report = time.time()
-        time.sleep(1)
 
-    block_queue.join()
-    elapsed = time.time() - start_time
-    logger.info(f"Multithreaded scan completed in {elapsed:.1f} seconds.")
-    report_thread_status()
-    # Final block scan status report
-    with blocks_scanned_lock:
-        scanned = total_blocks_scanned
-    logger.info(f"Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned.")
+        worker_threads = []
+        for i in range(threads):
+            tname = f"worker-{i}"
+            t = threading.Thread(target=worker, args=(block_queue, tname), daemon=True)
+            worker_threads.append(t)
+            t.start()
+
+        # --- Main loop: refill queue and handle shutdown ---
+        total_blocks_to_scan = end_block - start_block + 1
+        last_report = 0
+        report_interval = 10  # seconds
+        status_reporting = False  # Initialize status_reporting variable
+        start_time = time.time()  # Move start_time here for progress calculations
+        last_progress_update = start_block  # Track last progress update
+        
+        while True:
+            # Refill the queue if needed (unless stop_event is set or all blocks queued)
+            while not stop_event.is_set() and block_queue.qsize() < max_queue_depth and next_block <= end_block:
+                block_queue.put(next_block)
+                next_block += 1
+            # Check if all workers are done and queue is empty
+            all_workers_done = not any(t.is_alive() for t in worker_threads)
+            queue_empty = block_queue.empty()
+            if stop_event.is_set():
+                status_reporting = True
+            if all_workers_done and queue_empty:
+                break
+            # Always report progress every report_interval seconds
+            if time.time() - last_report > report_interval:
+                with blocks_scanned_lock:
+                    scanned = total_blocks_scanned
+                elapsed = time.time() - start_time
+                if scanned > 0:
+                    blocks_per_second = scanned / elapsed
+                    remaining_blocks = total_blocks_to_scan - scanned
+                    eta_seconds = int(remaining_blocks / blocks_per_second)
+                    days, rem = divmod(eta_seconds, 86400)
+                    hours, rem = divmod(rem, 3600)
+                    minutes, seconds = divmod(rem, 60)
+                    eta_parts = []
+                    if days > 0:
+                        eta_parts.append(f"{days}d")
+                    if hours > 0 or days > 0:
+                        eta_parts.append(f"{hours}h")
+                    if minutes > 0 or hours > 0 or days > 0:
+                        eta_parts.append(f"{minutes}m")
+                    eta_parts.append(f"{seconds}s")
+                    eta_str = ' '.join(eta_parts)
+                else:
+                    eta_str = "calculating..."
+                logger.info(f"Progress: {scanned}/{total_blocks_to_scan} blocks scanned. Elapsed: {elapsed:.0f}s, ETA: {eta_str}")
+                
+                # Update scan progress periodically (every 100 blocks or so)
+                current_progress = start_block + scanned
+                if current_progress - last_progress_update >= 100:
+                    update_scan_progress(db_manager, current_progress, current_progress - last_progress_update)
+                    last_progress_update = current_progress
+                
+                if status_reporting:
+                    report_thread_status()
+                    logger.info(f"Queue size: {block_queue.qsize()}")
+                last_report = time.time()
+            time.sleep(1)
+
+        block_queue.join()
+        elapsed = time.time() - start_time
+        logger.info(f"Multithreaded scan completed in {elapsed:.1f} seconds.")
+        report_thread_status()
+        # Final block scan status report
+        with blocks_scanned_lock:
+            scanned = total_blocks_scanned
+        logger.info(f"Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned in {elapsed:.1f} seconds.")
+        
+        # Final progress update
+        final_progress = start_block + scanned
+        update_scan_progress(db_manager, final_progress, final_progress - last_progress_update)
+    finally:
+        db_manager.close()
 
 if __name__ == "__main__":
     main() 
