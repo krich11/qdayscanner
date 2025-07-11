@@ -40,6 +40,10 @@ stop_event = threading.Event()
 thread_status = {}
 thread_status_lock = threading.Lock()
 
+# Add at the top, after thread_status and thread_status_lock
+total_blocks_scanned = 0
+blocks_scanned_lock = threading.Lock()
+
 
 def is_p2pk_script(script_pub_key: Dict[str, Any]) -> Optional[str]:
     try:
@@ -162,13 +166,15 @@ def worker(block_queue: queue.Queue, thread_name: str):
         thread_status[thread_name] = 'running'
     total_found = 0
     try:
-        while not stop_event.is_set():
+        while True:
             try:
                 height = block_queue.get(timeout=0.5)
             except queue.Empty:
-                break
-            if stop_event.is_set():
-                break
+                if stop_event.is_set():
+                    break
+                else:
+                    continue
+            # If stop_event is set, continue draining the queue until empty
             try:
                 block = bitcoin_rpc.get_block_by_height(height)
                 block_time = block['time']
@@ -181,6 +187,13 @@ def worker(block_queue: queue.Queue, thread_name: str):
                 logger.error(f"Error processing block {height}: {e}")
             finally:
                 block_queue.task_done()
+                # Increment global blocks scanned counter
+                global total_blocks_scanned
+                with blocks_scanned_lock:
+                    total_blocks_scanned += 1
+            # Exit if stop_event is set and queue is empty
+            if stop_event.is_set() and block_queue.empty():
+                break
         with thread_status_lock:
             thread_status[thread_name] = 'finished'
     except Exception as e:
@@ -245,8 +258,13 @@ def main():
     kb_thread.start()
 
     block_queue = queue.Queue()
-    for h in range(start_block, end_block + 1):
-        block_queue.put(h)
+    next_block = start_block
+    max_queue_depth = threads * 2
+
+    # Fill the queue initially
+    for _ in range(min(max_queue_depth, end_block - start_block + 1)):
+        block_queue.put(next_block)
+        next_block += 1
 
     worker_threads = []
     for i in range(threads):
@@ -255,18 +273,41 @@ def main():
         worker_threads.append(t)
         t.start()
 
+    # --- Main loop: refill queue and handle shutdown ---
+    total_blocks_to_scan = end_block - start_block + 1
     last_report = 0
-    while any(t.is_alive() for t in worker_threads):
-        time.sleep(1)
-        # Optionally, report progress every 5 seconds
-        if time.time() - last_report > 5:
-            report_thread_status()
+    report_interval = 10  # seconds
+    while True:
+        # Refill the queue if needed (unless stop_event is set or all blocks queued)
+        while not stop_event.is_set() and block_queue.qsize() < max_queue_depth and next_block <= end_block:
+            block_queue.put(next_block)
+            next_block += 1
+        # Check if all workers are done and queue is empty
+        all_workers_done = not any(t.is_alive() for t in worker_threads)
+        queue_empty = block_queue.empty()
+        if stop_event.is_set():
+            status_reporting = True
+        if all_workers_done and queue_empty:
+            break
+        # Always report progress every report_interval seconds
+        if time.time() - last_report > report_interval:
+            with blocks_scanned_lock:
+                scanned = total_blocks_scanned
+            logger.info(f"Progress: {scanned}/{total_blocks_to_scan} blocks scanned.")
+            if status_reporting:
+                report_thread_status()
+                logger.info(f"Queue size: {block_queue.qsize()}")
             last_report = time.time()
+        time.sleep(1)
 
     block_queue.join()
     elapsed = time.time() - start_time
     logger.info(f"Multithreaded scan completed in {elapsed:.1f} seconds.")
     report_thread_status()
+    # Final block scan status report
+    with blocks_scanned_lock:
+        scanned = total_blocks_scanned
+    logger.info(f"Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned.")
 
 if __name__ == "__main__":
     main() 
