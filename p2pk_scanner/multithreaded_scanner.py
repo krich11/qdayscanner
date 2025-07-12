@@ -45,6 +45,18 @@ total_blocks_scanned = 0
 blocks_scanned_lock = threading.Lock()
 
 
+def format_time_dd_hh_mm_ss(seconds: float) -> str:
+    """Format time in DD:HH:MM:SS format."""
+    if seconds < 0:
+        return "00D:00H:00M:00S"
+    
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    
+    return f"{days:02d}D:{hours:02d}H:{minutes:02d}M:{secs:02d}S"
+
+
 def ensure_scan_progress_row(db_manager):
     """Ensure the scan_progress row for the multithreaded scanner exists."""
     try:
@@ -364,21 +376,11 @@ def main():
                     blocks_per_second = scanned / elapsed
                     remaining_blocks = total_blocks_to_scan - scanned
                     eta_seconds = int(remaining_blocks / blocks_per_second)
-                    days, rem = divmod(eta_seconds, 86400)
-                    hours, rem = divmod(rem, 3600)
-                    minutes, seconds = divmod(rem, 60)
-                    eta_parts = []
-                    if days > 0:
-                        eta_parts.append(f"{days}d")
-                    if hours > 0 or days > 0:
-                        eta_parts.append(f"{hours}h")
-                    if minutes > 0 or hours > 0 or days > 0:
-                        eta_parts.append(f"{minutes}m")
-                    eta_parts.append(f"{seconds}s")
-                    eta_str = ' '.join(eta_parts)
+                    eta_str = format_time_dd_hh_mm_ss(eta_seconds)
                 else:
                     eta_str = "calculating..."
-                logger.info(f"Progress: {scanned}/{total_blocks_to_scan} blocks scanned. Elapsed: {elapsed:.0f}s, ETA: {eta_str}")
+                elapsed_str = format_time_dd_hh_mm_ss(elapsed)
+                logger.info(f"Progress: {scanned}/{total_blocks_to_scan} blocks scanned. Elapsed: {elapsed_str}, ETA: {eta_str}")
                 
                 # Update scan progress periodically (every 100 blocks or so)
                 current_progress = start_block + scanned
@@ -394,12 +396,13 @@ def main():
 
         block_queue.join()
         elapsed = time.time() - start_time
-        logger.info(f"Multithreaded scan completed in {elapsed:.1f} seconds.")
+        elapsed_str = format_time_dd_hh_mm_ss(elapsed)
+        logger.info(f"Multithreaded scan completed in {elapsed_str}.")
         report_thread_status()
         # Final block scan status report
         with blocks_scanned_lock:
             scanned = total_blocks_scanned
-        logger.info(f"Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned in {elapsed:.1f} seconds.")
+        logger.info(f"Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned in {elapsed_str}.")
         
         # Final progress update
         final_progress = start_block + scanned
