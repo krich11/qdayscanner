@@ -136,6 +136,82 @@ class BitcoinRPC:
             return result
         raise Exception("get_raw_transaction did not return a dict")
     
+    def get_raw_transactions_batch(self, txids: List[str], verbose: bool = True, block_hash: str = None, max_batch_size: int = 50) -> List[Dict[str, Any]]:
+        """Get multiple raw transactions using chunked batch requests to avoid connection timeouts."""
+        if not txids:
+            return []
+        
+        # Split into chunks to avoid massive responses
+        all_transactions = []
+        
+        for chunk_start in range(0, len(txids), max_batch_size):
+            chunk_end = min(chunk_start + max_batch_size, len(txids))
+            chunk_txids = txids[chunk_start:chunk_end]
+            
+            # Create batch requests for this chunk
+            batch_requests = []
+            for i, txid in enumerate(chunk_txids):
+                params = [txid, verbose]
+                if block_hash:
+                    params.append(block_hash)
+                
+                batch_requests.append({
+                    'jsonrpc': '1.0',
+                    'id': f'batch_{chunk_start + i}',
+                    'method': 'getrawtransaction',
+                    'params': params
+                })
+            
+            # Make batch request for this chunk
+            url = f"http://{self.host}:{self.port}"
+            headers = {'Content-Type': 'application/json'}
+            
+            chunk_transactions = []
+            for attempt in range(config.MAX_RETRIES):
+                try:
+                    response = self.session.post(
+                        url,
+                        auth=self.auth,
+                        headers=headers,
+                        json=batch_requests,
+                        timeout=config.CONNECTION_TIMEOUT * 3  # Even longer timeout for large blocks
+                    )
+                    response.raise_for_status()
+                    
+                    results = response.json()
+                    
+                    # Handle both single response and batch response
+                    if not isinstance(results, list):
+                        results = [results]
+                    
+                    for result in results:
+                        if 'error' in result and result['error'] is not None:
+                            logger.warning(f"Batch RPC error for ID {result.get('id')}: {result['error']}")
+                            chunk_transactions.append(None)  # Mark as failed
+                        else:
+                            result_data = result.get('result')
+                            if result_data is None:
+                                logger.warning(f"No result in batch RPC response for ID {result.get('id')}")
+                                chunk_transactions.append(None)
+                            else:
+                                chunk_transactions.append(result_data)
+                    
+                    # Success, break out of retry loop
+                    break
+                    
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Batch RPC chunk failed (attempt {attempt + 1}/{config.MAX_RETRIES}): {e}")
+                    if attempt < config.MAX_RETRIES - 1:
+                        time.sleep(config.RETRY_DELAY * 2)  # Longer delay for chunk failures
+                    else:
+                        # On final failure, add None entries for this chunk
+                        logger.error(f"Batch RPC chunk failed after {config.MAX_RETRIES} attempts, adding None entries")
+                        chunk_transactions.extend([None] * len(chunk_txids))
+            
+            all_transactions.extend(chunk_transactions)
+        
+        return all_transactions
+    
     def test_connection(self) -> bool:
         """Test RPC connection to Bitcoin Core."""
         try:

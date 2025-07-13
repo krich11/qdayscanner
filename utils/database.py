@@ -86,13 +86,33 @@ class DatabaseManager:
         """Execute a query and return results as a list of dictionaries."""
         with self.get_cursor() as cursor:
             cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+            try:
+                return [dict(row) for row in cursor.fetchall()]
+            except psycopg2.ProgrammingError as e:
+                if "no results to fetch" in str(e):
+                    # This is normal for INSERT/UPDATE/DELETE without RETURNING
+                    return []
+                else:
+                    raise
     
     def execute_command(self, command: str, params: Optional[tuple] = None) -> int:
         """Execute a command and return the number of affected rows."""
         with self.get_cursor() as cursor:
             cursor.execute(command, params)
             return cursor.rowcount
+    
+    def execute_upsert(self, query: str, params: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
+        """Execute an upsert query with RETURNING clause and return the first result."""
+        with self.get_cursor() as cursor:
+            cursor.execute(query, params)
+            try:
+                result = cursor.fetchone()
+                return dict(result) if result else None
+            except psycopg2.ProgrammingError as e:
+                if "no results to fetch" in str(e):
+                    return None
+                else:
+                    raise
     
     def table_exists(self, table_name: str) -> bool:
         """Check if a table exists in the database."""

@@ -380,7 +380,8 @@ def main():
                 else:
                     eta_str = "calculating..."
                 elapsed_str = format_time_dd_hh_mm_ss(elapsed)
-                logger.info(f"Progress: {scanned}/{total_blocks_to_scan} blocks scanned. Elapsed: {elapsed_str}, ETA: {eta_str}")
+                blocks_per_second = scanned / elapsed if elapsed > 0 else 0
+                logger.info(f"Progress: {scanned}/{total_blocks_to_scan} blocks scanned. Elapsed: {elapsed_str}, ETA: {eta_str}, Speed: {blocks_per_second:.2f} blocks/sec")
                 
                 # Update scan progress periodically (every 100 blocks or so)
                 current_progress = start_block + scanned
@@ -397,12 +398,20 @@ def main():
         block_queue.join()
         elapsed = time.time() - start_time
         elapsed_str = format_time_dd_hh_mm_ss(elapsed)
-        logger.info(f"Multithreaded scan completed in {elapsed_str}.")
-        report_thread_status()
-        # Final block scan status report
+        
+        # Calculate final statistics
         with blocks_scanned_lock:
             scanned = total_blocks_scanned
+        
+        blocks_per_second = scanned / elapsed if elapsed > 0 else 0
+        
+        logger.info(f"Multithreaded scan completed in {elapsed_str}.")
+        logger.info(f"Performance: {blocks_per_second:.2f} blocks per second")
+        report_thread_status()
+        
+        # Final block scan status report
         logger.info(f"Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned in {elapsed_str}.")
+        logger.info(f"Average Speed: {blocks_per_second:.2f} blocks/second")
         
         # Final progress update
         final_progress = start_block + scanned
