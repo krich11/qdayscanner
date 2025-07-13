@@ -1,7 +1,13 @@
-#!/usr/bin/env python3
+#!/home/krich/bitcoin/scanner/qdayscanner/venv/bin/python
 """
 Verify database is clean after reset.
 """
+
+import sys
+from pathlib import Path
+
+# Add parent directory to path to import utils
+sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.database import get_cursor
 

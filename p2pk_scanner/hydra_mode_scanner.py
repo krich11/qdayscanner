@@ -39,6 +39,17 @@ logger = logging.getLogger(__name__)
 
 # For graceful shutdown
 stop_event = threading.Event()
+pause_event = threading.Event()  # New pause event for temporary worker suspension
+
+# Auto-pause configuration for database bottleneck management
+auto_pause_enabled = True  # Enable automatic pause/resume based on queue depth
+auto_pause_threshold = 50000  # Pause when queue depth exceeds this
+auto_resume_threshold = 10000  # Resume when queue depth drops below this
+
+# Worker tracking for graceful shutdown
+active_workers = set()  # Set of worker thread names currently processing blocks
+active_workers_lock = threading.Lock()
+
 thread_status = {}
 thread_status_lock = threading.Lock()
 
@@ -113,6 +124,33 @@ def format_time_dd_hh_mm_ss(seconds: float) -> str:
     return f"{days:02d}D:{hours:02d}H:{minutes:02d}M:{secs:02d}S"
 
 
+def check_auto_pause(db_manager) -> bool:
+    """Check queue depth and automatically pause/resume workers to manage database bottleneck."""
+    if not auto_pause_enabled:
+        return False
+    
+    try:
+        queue_depth = db_manager.write_queue.qsize()
+        
+        # Check if we should pause
+        if queue_depth > auto_pause_threshold and not pause_event.is_set():
+            logger.warning(f"🔄 Auto-pausing workers: queue depth {queue_depth:,} > {auto_pause_threshold:,}")
+            pause_event.set()
+            return True
+        
+        # Check if we should resume
+        elif queue_depth < auto_resume_threshold and pause_event.is_set():
+            logger.info(f"▶️ Auto-resuming workers: queue depth {queue_depth:,} < {auto_resume_threshold:,}")
+            pause_event.clear()
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error checking auto-pause: {e}")
+        return False
+
+
 class HydraModeDatabaseManager:
     """High-performance database manager with batch operations and write-behind caching."""
     
@@ -183,17 +221,18 @@ class HydraModeDatabaseManager:
             try:
                 # Collect items from queue with timeout
                 try:
-                    item = self.write_queue.get(timeout=1.0)
+                    item = self.write_queue.get(timeout=0.5)  # Reduced timeout for more frequent checks
                     batch.append(item)
                 except queue.Empty:
                     # Flush if we have items and enough time has passed
-                    if batch and (time.time() - last_flush) > 5.0:
+                    if batch and (time.time() - last_flush) > 2.0:  # Reduced timeout from 5s to 2s
                         pass  # Continue to flush
                     else:
                         continue
                 
                 # Flush batch when it reaches threshold or timeout
-                if len(batch) >= self.batch_size or (batch and (time.time() - last_flush) > 5.0):
+                if len(batch) >= self.batch_size or (batch and (time.time() - last_flush) > 2.0):  # Reduced timeout
+                    logger.debug(f"🔄 Writer thread flushing batch of {len(batch)} items (threshold: {self.batch_size}, timeout: {time.time() - last_flush:.1f}s)")
                     self._flush_batch(batch)
                     batch.clear()
                     last_flush = time.time()
@@ -293,6 +332,14 @@ class HydraModeDatabaseManager:
                 performance_stats['batch_inserts_performed'] += 1
                 performance_stats['total_transactions_processed'] += len(transaction_ops)
                 performance_stats['total_addresses_found'] += len(address_ops)
+                
+                # Log batch processing details for debugging
+                if len(address_ops) > 0 or len(transaction_ops) > 0:
+                    logger.info(f"📊 Batch processed: {len(address_ops)} addresses, {len(transaction_ops)} transactions, {len(block_ops)} blocks")
+                    if len(address_ops) == 0 and len(transaction_ops) > 0:
+                        logger.info(f"📝 Note: {len(transaction_ops)} transactions processed but no new addresses found (existing addresses being updated)")
+                    elif len(address_ops) > 0:
+                        logger.info(f"🎯 Found {len(address_ops)} new P2PK addresses!")
             with metrics_lock:
                 performance_metrics['batch_flushes'] += 1
                 performance_metrics['batch_flush_time_total'] += batch_time
@@ -647,9 +694,20 @@ def update_scan_progress(db_manager, block_height: int, blocks_scanned: int = 1)
         SET last_scanned_block = %s, total_blocks_scanned = total_blocks_scanned + %s, last_updated = CURRENT_TIMESTAMP
         WHERE scanner_name = %s
         """
-        db_manager.execute_command(query, (block_height, blocks_scanned, 'hydra_mode_p2pk_scanner'))
+        # Try HydraModeDatabaseManager first
+        if hasattr(db_manager, 'db_manager'):
+            db_manager.db_manager.execute_command(query, (block_height, blocks_scanned, 'hydra_mode_p2pk_scanner'))
+        else:
+            # Direct DatabaseManager
+            db_manager.execute_command(query, (block_height, blocks_scanned, 'hydra_mode_p2pk_scanner'))
     except Exception as e:
         logger.error(f"Error updating scan progress: {e}")
+        # Fallback: try direct database manager
+        try:
+            from utils.database import db_manager as direct_db
+            direct_db.execute_command(query, (block_height, blocks_scanned, 'hydra_mode_p2pk_scanner'))
+        except Exception as e2:
+            logger.error(f"Fallback database update also failed: {e2}")
 
 
 def is_p2pk_script(script_pub_key: Dict[str, Any]) -> Optional[str]:
@@ -700,6 +758,131 @@ def is_p2pk_script(script_pub_key: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+def might_be_p2pk_input(vin: Dict[str, Any]) -> bool:
+    """
+    Determine if an input might be P2PK based on available information.
+    Returns True if the input could potentially be P2PK, False if it's definitely not.
+    """
+    # If we have scriptSig, we can check the signature length
+    if 'scriptSig' in vin and 'asm' in vin['scriptSig']:
+        asm = vin['scriptSig']['asm']
+        # P2PK signatures are typically 71-73 bytes (142-146 hex chars)
+        # Check if the signature looks like it could be for P2PK
+        parts = asm.split()
+        if len(parts) >= 1:
+            signature = parts[0]
+            # P2PK signatures are typically 71-73 bytes
+            if len(signature) >= 142 and len(signature) <= 146:
+                return True
+            # If signature is shorter, it's likely not P2PK
+            return False
+    
+    # If we don't have scriptSig info, we have to assume it might be P2PK
+    # This is conservative - we'd rather check than miss a P2PK transaction
+    return True
+
+
+def quick_scan_block_for_p2pk(block_data: Dict[str, Any]) -> bool:
+    """
+    Quick scan to check if a block contains any P2PK transactions.
+    This scans the structured transaction data from RPC instead of raw hex.
+    
+    Returns True if the block might contain P2PK transactions, False if definitely not.
+    """
+    try:
+        # Get transactions from the block data
+        transactions = block_data.get('tx', [])
+        if not transactions:
+            # If no transactions, definitely no P2PK
+            return False
+        
+        # Quick scan each transaction's outputs for P2PK patterns
+        for tx in transactions:
+            vouts = tx.get('vout', [])
+            for vout in vouts:
+                script_pub_key = vout.get('scriptPubKey', {})
+                
+                # Check if this is a P2PK output
+                if script_pub_key.get('type') == 'pubkey':
+                    # Found a P2PK output, return True immediately
+                    return True
+                
+                # Also check the ASM for P2PK patterns
+                asm = script_pub_key.get('asm', '')
+                if 'OP_CHECKSIG' in asm:
+                    # Look for public key patterns in ASM
+                    parts = asm.split()
+                    if len(parts) >= 2 and parts[-1] == 'OP_CHECKSIG':
+                        public_key = parts[0]
+                        # Check if it looks like a valid public key
+                        if (len(public_key) == 130 and public_key.startswith('04')) or \
+                           (len(public_key) == 66 and public_key.startswith(('02', '03'))):
+                            return True
+        
+        # No P2PK outputs found in any transaction
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error in quick scan for block: {e}")
+        # If quick scan fails, assume block might contain P2PK (conservative)
+        return True
+
+
+def quick_scan_transaction_for_p2pk(tx_data: Dict[str, Any]) -> bool:
+    """
+    Quick scan to check if a transaction contains any P2PK patterns.
+    This is much faster than full decoding and can skip transactions with no P2PK.
+    
+    Returns True if the transaction might contain P2PK, False if definitely not.
+    """
+    try:
+        # Get the raw transaction hex to scan for P2PK patterns
+        tx_hex = tx_data.get('hex', '')
+        if not tx_hex:
+            # If we don't have hex data, we have to assume it might contain P2PK
+            return True
+        
+        # Look for complete P2PK output patterns in the raw transaction data
+        # P2PK outputs have these specific patterns:
+        # - 41 + 65 bytes (uncompressed) + ac = 134 hex chars total
+        # - 41 + 33 bytes (compressed) + ac = 70 hex chars total
+        
+        # Search for complete P2PK output patterns
+        if '41' in tx_hex:
+            # Find all occurrences of '41' and check if they're followed by P2PK patterns
+            pos = 0
+            while True:
+                pos = tx_hex.find('41', pos)
+                if pos == -1:
+                    break
+                
+                # Check if this could be the start of a P2PK script
+                if pos + 134 <= len(tx_hex):
+                    # Check for uncompressed P2PK: 41 + 130 chars + ac
+                    potential_p2pk = tx_hex[pos:pos + 134]
+                    if (potential_p2pk.startswith('41') and 
+                        potential_p2pk.endswith('ac') and
+                        potential_p2pk[2:4] in ['04', '02', '03']):
+                        return True
+                
+                if pos + 70 <= len(tx_hex):
+                    # Check for compressed P2PK: 41 + 66 chars + ac
+                    potential_p2pk = tx_hex[pos:pos + 70]
+                    if (potential_p2pk.startswith('41') and 
+                        potential_p2pk.endswith('ac') and
+                        potential_p2pk[2:4] in ['02', '03']):
+                        return True
+                
+                pos += 1
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error in quick scan for transaction: {e}")
+        # If quick scan fails, assume transaction might contain P2PK (conservative)
+        return True
+
+
 def process_transaction(tx: Dict[str, Any], block_height: int, block_time: int, transaction_cache: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Process a transaction and extract P2PK addresses."""
     if transaction_cache is None:
@@ -709,7 +892,8 @@ def process_transaction(tx: Dict[str, Any], block_height: int, block_time: int, 
     
     try:
         # Process outputs (receiving)
-        for vout_idx, vout in enumerate(tx.get('vout', [])):
+        vouts = tx.get('vout', [])
+        for vout_idx, vout in enumerate(vouts):
             try:
                 script_pub_key = vout.get('scriptPubKey', {})
                 public_key = is_p2pk_script(script_pub_key)
@@ -728,13 +912,19 @@ def process_transaction(tx: Dict[str, Any], block_height: int, block_time: int, 
                 logger.error(f"Vout data: {vout}")
         
         # Process inputs (spending)
-        for vin_idx, vin in enumerate(tx.get('vin', [])):
+        vins = tx.get('vin', [])
+        for vin_idx, vin in enumerate(vins):
             if 'txid' in vin and 'vout' in vin:
+                # Check if this input might be P2PK before fetching
+                if not might_be_p2pk_input(vin):
+                    continue
+                
                 try:
                     # Use cached transaction if available, otherwise fetch individually
                     if transaction_cache and vin['txid'] in transaction_cache:
                         prev_tx = transaction_cache[vin['txid']]
                     else:
+                        # Individual RPC call for input transaction
                         prev_tx = bitcoin_rpc.get_raw_transaction(vin['txid'])
                     
                     if prev_tx and 'vout' in prev_tx:
@@ -754,6 +944,7 @@ def process_transaction(tx: Dict[str, Any], block_height: int, block_time: int, 
                 except Exception as e:
                     logger.error(f"CRITICAL: Could not process input transaction {vin['txid']} in tx {tx.get('txid', 'unknown')}: {e}")
                     logger.error(f"Vin data: {vin}")
+        
     except Exception as e:
         logger.error(f"CRITICAL: Error processing transaction {tx.get('txid', 'unknown')}: {e}")
         logger.error(f"Transaction data: {tx}")
@@ -761,28 +952,63 @@ def process_transaction(tx: Dict[str, Any], block_height: int, block_time: int, 
     return p2pk_transactions
 
 
-def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDatabaseManager, enable_profiling=False, batch_rpc=False):
-    """Worker thread that processes blocks from its own queue."""
+
+
+
+def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDatabaseManager, enable_profiling=False, batch_rpc=False, rpc_batch_size=25, quick_scan=False):
     global total_blocks_scanned
+    global active_workers
     
     # Set up profiling if enabled
     if enable_profiling:
         profiler = cProfile.Profile()
         profiler.enable()
     
-    while not stop_event.is_set():
+    # CRITICAL FIX: Workers should continue processing their queue until it's empty
+    # Only exit when queue is empty AND stop event is set
+    while True:
         try:
-            block_height = worker_queue.get(timeout=1.0)
-            if block_height is None:  # Sentinel value
+            # Get block with timeout - this allows checking stop_event periodically
+            try:
+                block_height = worker_queue.get(timeout=1.0)
+            except queue.Empty:
+                # Queue is empty, check if we should exit
+                if stop_event.is_set():
+                    logger.info(f"🧵 {thread_name}: Queue empty and stop event set, exiting")
+                    break
+                continue
+            
+            # Check if this is a sentinel value (shutdown signal)
+            if block_height is None:
+                logger.info(f"🧵 {thread_name} received shutdown signal")
                 break
             
-            # Track RPC timing
-            rpc_start = time.time()
+            # Check for pause signal - wait until resume
+            while pause_event.is_set() and not stop_event.is_set():
+                with thread_status_lock:
+                    thread_status[thread_name] = f"Paused (block {block_height})"
+                time.sleep(0.1)  # Small sleep to avoid busy waiting
+            
+            # CRITICAL FIX: Don't exit here even if stop_event is set
+            # We have a block to process, so we should complete it
+            # The worker will only exit when the queue is empty AND stop_event is set
+            
+            # Mark that we're processing this block (for shutdown tracking)
+            with thread_status_lock:
+                thread_status[thread_name] = f"Processing block {block_height}"
+            
+            # Track active worker for graceful shutdown
+            with active_workers_lock:
+                active_workers.add(thread_name)
+            
+            # CRITICAL: Once we start processing a block, we MUST complete it
+            # even if stop_event is set during processing
             block_processing_succeeded = False
             
             try:
                 # Get block data
                 block_data = bitcoin_rpc.get_block_by_height(block_height)
+                
                 if not block_data:
                     logger.error(f"Failed to get block {block_height}")
                     with metrics_lock:
@@ -790,15 +1016,24 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
                     continue
                 
                 # Track RPC performance
-                rpc_time = time.time() - rpc_start
                 with metrics_lock:
                     performance_metrics['rpc_calls'] += 1
-                    performance_metrics['rpc_time_total'] += rpc_time
-                    performance_metrics['rpc_time_avg'] = performance_metrics['rpc_time_total'] / performance_metrics['rpc_calls']
-                    if rpc_time < performance_metrics['rpc_time_min']:
-                        performance_metrics['rpc_time_min'] = rpc_time
-                    if rpc_time > performance_metrics['rpc_time_max']:
-                        performance_metrics['rpc_time_max'] = rpc_time
+                
+                # Quick scan optimization: Check if block contains P2PK before full processing
+                if quick_scan:
+                    quick_scan_result = quick_scan_block_for_p2pk(block_data)
+                    if not quick_scan_result:
+                        # Block contains no P2PK transactions, skip full processing
+                        logger.info(f"⚡ Quick scan: Block {block_height} skipped (no P2PK signatures found)")
+                        with blocks_scanned_lock:
+                            total_blocks_scanned += 1
+                        with metrics_lock:
+                            performance_metrics['blocks_processed'] += 1
+                        with thread_status_lock:
+                            thread_status[thread_name] = f"Skipped block {block_height} (no P2PK)"
+                        update_scan_progress(db_manager.db_manager, block_height)
+                        continue
+                    # Block contains P2PK patterns, continue with full processing (no log needed)
                 
                 # Process transactions
                 block_time = block_data['time']
@@ -808,20 +1043,11 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
                     # Use batched RPC for transaction processing
                     txids = [tx['txid'] for tx in transactions]
                     
-                    # Track RPC timing for batch call
-                    batch_rpc_start = time.time()
-                    raw_transactions = bitcoin_rpc.get_raw_transactions_batch(txids, max_batch_size=50)
-                    batch_rpc_time = time.time() - batch_rpc_start
-                    
                     # Track RPC performance (count as 1 call for the batch)
                     with metrics_lock:
                         performance_metrics['rpc_calls'] += 1
-                        performance_metrics['rpc_time_total'] += batch_rpc_time
-                        performance_metrics['rpc_time_avg'] = performance_metrics['rpc_time_total'] / performance_metrics['rpc_calls']
-                        if batch_rpc_time < performance_metrics['rpc_time_min']:
-                            performance_metrics['rpc_time_min'] = batch_rpc_time
-                        if batch_rpc_time > performance_metrics['rpc_time_max']:
-                            performance_metrics['rpc_time_max'] = batch_rpc_time
+                    
+                    raw_transactions = bitcoin_rpc.get_raw_transactions_batch(txids, max_batch_size=rpc_batch_size)
                     
                     # Create transaction cache for batch processing
                     transaction_cache = {}
@@ -843,11 +1069,7 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
                     # Batch fetch input transactions if we have any
                     if input_txids:
                         input_txid_list = list(input_txids)
-                        
-                        # Track RPC timing for input batch call
-                        input_batch_rpc_start = time.time()
-                        input_raw_transactions = bitcoin_rpc.get_raw_transactions_batch(input_txid_list, max_batch_size=50)
-                        input_batch_rpc_time = time.time() - input_batch_rpc_start
+                        input_raw_transactions = bitcoin_rpc.get_raw_transactions_batch(input_txid_list, max_batch_size=rpc_batch_size)
                         
                         # Add input transactions to cache
                         for raw_tx in input_raw_transactions:
@@ -857,20 +1079,16 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
                         # Track RPC performance for input batch
                         with metrics_lock:
                             performance_metrics['rpc_calls'] += 1
-                            performance_metrics['rpc_time_total'] += input_batch_rpc_time
-                            performance_metrics['rpc_time_avg'] = performance_metrics['rpc_time_total'] / performance_metrics['rpc_calls']
-                            if input_batch_rpc_time < performance_metrics['rpc_time_min']:
-                                performance_metrics['rpc_time_min'] = input_batch_rpc_time
-                            if input_batch_rpc_time > performance_metrics['rpc_time_max']:
-                                performance_metrics['rpc_time_max'] = input_batch_rpc_time
                     
                     # Process each transaction with its raw data
+                    total_p2pk_found = 0
                     for i, (tx, raw_tx) in enumerate(zip(transactions, raw_transactions)):
                         if raw_tx is None:
                             logger.warning(f"Failed to get raw transaction for {tx['txid']}")
                             continue
                         
                         p2pk_transactions = process_transaction(raw_tx, block_height, block_time, transaction_cache)
+                        total_p2pk_found += len(p2pk_transactions)
                         
                         # Add to database manager with error tracking
                         p2pk_added_count = 0
@@ -901,10 +1119,17 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
                         
                         if p2pk_added_count != len(p2pk_transactions):
                             logger.error(f"CRITICAL: P2PK data loss detected! Found {len(p2pk_transactions)} but only added {p2pk_added_count} in tx {raw_tx['txid'][:16]}...")
+                    
+                    # Log if no P2PK transactions were found in this block
+                    if total_p2pk_found == 0:
+                        logger.info(f"📭 Block {block_height} processed: {len(transactions)} transactions, 0 P2PK addresses found")
+                    
                 else:
                     # Process transactions individually (original method)
+                    total_p2pk_found = 0
                     for tx in transactions:
                         p2pk_transactions = process_transaction(tx, block_height, block_time)
+                        total_p2pk_found += len(p2pk_transactions)
                         
                         # Add to database manager with error tracking
                         p2pk_added_count = 0
@@ -935,13 +1160,36 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
                         
                         if p2pk_added_count != len(p2pk_transactions):
                             logger.error(f"CRITICAL: P2PK data loss detected! Found {len(p2pk_transactions)} but only added {p2pk_added_count} in tx {tx['txid'][:16]}...")
+                    
+                    # Log if no P2PK transactions were found in this block
+                    if total_p2pk_found == 0:
+                        logger.info(f"📭 Block {block_height} processed: {len(transactions)} transactions, 0 P2PK addresses found")
                 
-                # RESEARCH-GRADE: Only mark block as successfully processed if we reach here
+                # Update scan progress
+                with blocks_scanned_lock:
+                    total_blocks_scanned += 1
+                
+                # Update database progress
+                update_scan_progress(db_manager.db_manager, block_height)
+                
+                # Record that this block was processed (even if no P2PK found)
+                # This ensures verify_blocks can distinguish between unprocessed and empty blocks
+                try:
+                    db_manager.db_manager.execute_command("""
+                        INSERT INTO scan_progress (scanner_name, last_scanned_block, total_blocks_scanned, last_updated)
+                        VALUES ('block_processed_marker', %s, 1, CURRENT_TIMESTAMP)
+                        ON CONFLICT (scanner_name) DO UPDATE SET
+                            last_scanned_block = EXCLUDED.last_scanned_block,
+                            total_blocks_scanned = scan_progress.total_blocks_scanned + 1,
+                            last_updated = CURRENT_TIMESTAMP
+                    """, (block_height,))
+                except Exception as e:
+                    logger.debug(f"Could not record processed block marker for {block_height}: {e}")
+                
+                # Mark block as successfully processed
                 block_processing_succeeded = True
                 
                 # Update counters only on successful processing
-                with blocks_scanned_lock:
-                    total_blocks_scanned += 1
                 with metrics_lock:
                     performance_metrics['blocks_processed'] += 1
                 
@@ -955,14 +1203,34 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
                     performance_metrics['blocks_failed'] += 1
                 # RESEARCH-GRADE: Do NOT increment total_blocks_scanned on failure
                 # This ensures failed blocks are not marked as "scanned"
+                
+                # CRITICAL: Still update scan progress to mark this block as attempted
+                # This prevents the block from being considered "missing" in verify_blocks
+                try:
+                    update_scan_progress(db_manager.db_manager, block_height)
+                    logger.info(f"Marked block {block_height} as attempted despite processing failure")
+                except Exception as progress_error:
+                    logger.error(f"Failed to update scan progress for block {block_height}: {progress_error}")
             
+            # CRITICAL: Always mark task as done, even if processing failed
+            # This ensures the worker can continue to the next block
             worker_queue.task_done()
+            
+            # Remove from active workers set
+            with active_workers_lock:
+                active_workers.discard(thread_name)
+            
+            # Update thread status to show we're ready for next block
+            with thread_status_lock:
+                thread_status[thread_name] = f"Ready for next block (last: {block_height})"
             
         except queue.Empty:
             continue
         except Exception as e:
             logger.error(f"Worker {thread_name} error: {e}")
-            break
+            # CRITICAL FIX: Don't break on exceptions - continue processing queue
+            # Only exit when queue is empty AND stop event is set
+            continue
     
     # Save profiling data if enabled
     if enable_profiling:
@@ -972,6 +1240,9 @@ def worker(worker_queue: queue.Queue, thread_name: str, db_manager: HydraModeDat
     
     with thread_status_lock:
         thread_status[thread_name] = "Stopped"
+    
+    # Terminal output when thread exits
+    logger.info(f"🧵 Worker thread {thread_name} has stopped")
 
 
 def distributor(main_queue: queue.Queue, worker_queues: List[queue.Queue], target_depth: int = 4):
@@ -1018,8 +1289,13 @@ def distributor(main_queue: queue.Queue, worker_queues: List[queue.Queue], targe
                 with metrics_lock:
                     performance_metrics['worker_queue_depths'][f'worker-{i}'] = current_depth
             
-            # Small sleep to prevent busy waiting
+            # Small sleep to prevent busy waiting, but check stop_event more frequently
             time.sleep(0.01)
+            
+            # Additional stop check to exit faster
+            if stop_event.is_set():
+                logger.info("🔄 Distributor: Stop event detected, exiting immediately")
+                break
             
         except Exception as e:
             logger.error(f"Distributor thread error: {e}")
@@ -1028,15 +1304,63 @@ def distributor(main_queue: queue.Queue, worker_queues: List[queue.Queue], targe
     logger.info("🔄 Distributor thread stopped")
 
 
-def keyboard_listener():
+def keyboard_listener(db_manager=None):
     """Listen for keyboard input to stop scanning gracefully."""
     while not stop_event.is_set():
         if select.select([sys.stdin], [], [], 0.1)[0]:
             line = sys.stdin.readline()
-            if line.strip().lower() == 'q':
+            command = line.strip().lower()
+            
+            if command == 'q':
                 logger.info("Received quit signal")
                 stop_event.set()
                 break
+            elif command == 'p':
+                if pause_event.is_set():
+                    logger.info("Received resume signal")
+                    pause_event.clear()
+                else:
+                    logger.info("Received pause signal")
+                    pause_event.set()
+            elif command == 'h':
+                print("\n📋 Available commands:")
+                print("  q - Quit scanner")
+                print("  p - Pause/Resume workers")
+                print("  h - Show this help")
+                print("  s - Show status")
+                print("  i - Show P2PK integrity")
+                print("  m - Show detailed metrics")
+                print("  u - Show queue status")
+                if auto_pause_enabled:
+                    print(f"  🔄 Auto-pause: Pause at {auto_pause_threshold:,}, resume at {auto_resume_threshold:,}")
+            elif command == 's':
+                report_thread_status()
+                report_performance_stats()
+            elif command == 'i':
+                report_p2pk_integrity()
+            elif command == 'm':
+                report_detailed_performance_metrics()
+            elif command == 'u':
+                # Show current queue depth and auto-pause status
+                if db_manager is not None:
+                    try:
+                        queue_depth = db_manager.write_queue.qsize()
+                        print(f"\n📊 Queue Status:")
+                        print(f"  Output queue depth: {queue_depth:,}")
+                        print(f"  Auto-pause enabled: {auto_pause_enabled}")
+                        if auto_pause_enabled:
+                            print(f"  Pause threshold: {auto_pause_threshold:,}")
+                            print(f"  Resume threshold: {auto_resume_threshold:,}")
+                            if pause_event.is_set():
+                                print(f"  Status: ⏸️ PAUSED (queue depth {queue_depth:,} > {auto_pause_threshold:,})")
+                            else:
+                                print(f"  Status: ▶️ RUNNING (queue depth {queue_depth:,} < {auto_pause_threshold:,})")
+                        else:
+                            print(f"  Status: {'⏸️ PAUSED' if pause_event.is_set() else '▶️ RUNNING'} (manual)")
+                    except Exception as e:
+                        print(f"Error getting queue status: {e}")
+                else:
+                    print("Queue status not available (db_manager not provided)")
 
 
 def report_thread_status():
@@ -1047,7 +1371,7 @@ def report_thread_status():
             print(f"  {thread_name}: {status}")
 
 
-def report_performance_stats(db_manager=None):
+def report_performance_stats(db_manager=None, worker_queues=None):
     """Report basic performance statistics."""
     with stats_lock:
         print(f"\n📊 PERFORMANCE STATS:")
@@ -1055,15 +1379,38 @@ def report_performance_stats(db_manager=None):
         print(f"  Total addresses found: {performance_stats['total_addresses_found']:,}")
         print(f"  Batch inserts performed: {performance_stats['batch_inserts_performed']:,}")
         print(f"  Queue operations: {performance_stats['queue_operations']:,}")
+        
+        # Calculate estimated P2PK transactions found from queue operations
+        # Each P2PK transaction adds 3 items to queue (address + transaction + block)
+        estimated_p2pk_txs = performance_stats['queue_operations'] // 3
+        if estimated_p2pk_txs > 0:
+            print(f"  Estimated P2PK transactions found: {estimated_p2pk_txs:,}")
+            if performance_stats['total_addresses_found'] == 0 and estimated_p2pk_txs > 0:
+                print(f"  Note: Processing existing P2PK addresses (no new addresses found yet)")
+        
+        # Show database state if available
+        if db_manager is not None and hasattr(db_manager, 'db_manager'):
+            try:
+                addr_count = db_manager.db_manager.execute_query("SELECT COUNT(*) as count FROM p2pk_addresses")[0]['count']
+                tx_count = db_manager.db_manager.execute_query("SELECT COUNT(*) as count FROM p2pk_transactions")[0]['count']
+                print(f"  Database state: {addr_count:,} addresses, {tx_count:,} transactions")
+            except Exception as e:
+                print(f"  Database state: Unable to query ({e})")
     
     with metrics_lock:
         if performance_metrics['queue_waiting_count'] > 0:
             print(f"  Queue waiting events: {performance_metrics['queue_waiting_count']:,}")
             avg_wait_time = performance_metrics['queue_waiting_time_total'] / performance_metrics['queue_waiting_count']
             print(f"  Avg queue wait time: {avg_wait_time:.4f}s")
+    
     # Output queue depth (write-behind cache)
     if db_manager is not None and hasattr(db_manager, 'write_queue'):
         print(f"  Output queue depth (write-behind cache): {db_manager.write_queue.qsize():,}")
+    
+    # Worker queue depths
+    if worker_queues is not None:
+        depths = [str(worker_queue.qsize()) for worker_queue in worker_queues]
+        print(f"  Worker queue depths: [ {' | '.join(depths)} ]")
 
 
 def report_p2pk_integrity():
@@ -1200,6 +1547,11 @@ def main(profile_mode=False, profile_output=None):
     parser.add_argument('--profile-output', type=str, default=None, help='Save cProfile output to file')
     parser.add_argument('--worker-profile', action='store_true', help='Enable worker thread profiling (separate from main thread)')
     parser.add_argument('--batch-rpc', action='store_true', help='Batch multiple transaction RPC calls for better performance')
+    parser.add_argument('--rpc-batch-size', type=int, default=25, help='RPC batch size for transaction fetching (default: 25)')
+    parser.add_argument('--quick-scan', action='store_true', help='Enable quick scan optimization to skip blocks with no P2PK patterns')
+    parser.add_argument('--no-auto-pause', action='store_true', help='Disable automatic pause/resume based on queue depth')
+    parser.add_argument('--pause-threshold', type=int, default=50000, help='Queue depth threshold to trigger auto-pause (default: 50000)')
+    parser.add_argument('--resume-threshold', type=int, default=10000, help='Queue depth threshold to trigger auto-resume (default: 10000)')
     
     args = parser.parse_args()
     
@@ -1226,11 +1578,24 @@ def main(profile_mode=False, profile_output=None):
 
 
 def _main(args):
+    
+    # Update auto-pause configuration based on command line arguments
+    global auto_pause_enabled, auto_pause_threshold, auto_resume_threshold
+    auto_pause_enabled = not args.no_auto_pause
+    auto_pause_threshold = args.pause_threshold
+    auto_resume_threshold = args.resume_threshold
+    
     logger.info("🐉 Starting HYDRA MODE P2PK Scanner...")
     logger.info(f"🔥 Configuration: {args.threads} threads, batch size {args.batch_size}, queue size {args.queue_size}")
     logger.info(f"🔄 Target depth: {args.target_depth} blocks per worker queue")
     if args.batch_rpc:
         logger.info("🚀 BATCH RPC ENABLED - Multiple transactions per RPC call")
+    if args.quick_scan:
+        logger.info("⚡ QUICK SCAN ENABLED - Skip blocks with no P2PK patterns")
+    if auto_pause_enabled:
+        logger.info(f"🔄 AUTO-PAUSE ENABLED - Pause at {auto_pause_threshold:,}, resume at {auto_resume_threshold:,}")
+    else:
+        logger.info("⏸️ AUTO-PAUSE DISABLED - Manual pause/resume only")
     
     if not bitcoin_rpc.test_connection():
         logger.error("Failed to connect to Bitcoin Core")
@@ -1271,8 +1636,21 @@ def _main(args):
         start_time = time.time()
         
         # Start keyboard listener thread
-        kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
+        kb_thread = threading.Thread(target=keyboard_listener, args=(db_manager,), daemon=True)
         kb_thread.start()
+        
+        # Show available commands
+        print("\n📋 Available commands:")
+        print("  q - Quit scanner")
+        print("  p - Pause/Resume workers")
+        print("  h - Show this help")
+        print("  s - Show status")
+        print("  i - Show P2PK integrity")
+        print("  m - Show detailed metrics")
+        print("  u - Show queue status")
+        if auto_pause_enabled:
+            print("  🔄 Auto-pause enabled (queue depth management)")
+        print()
         
         # Initialize main queue and worker queues
         main_queue = queue.Queue()
@@ -1296,7 +1674,7 @@ def _main(args):
         worker_threads = []
         for i in range(threads):
             tname = f"hydra-worker-{i}"
-            t = threading.Thread(target=worker, args=(worker_queues[i], tname, db_manager, args.worker_profile, args.batch_rpc), daemon=True)
+            t = threading.Thread(target=worker, args=(worker_queues[i], tname, db_manager, args.worker_profile, args.batch_rpc, args.rpc_batch_size, args.quick_scan), daemon=True)
             worker_threads.append(t)
             t.start()
         
@@ -1324,6 +1702,9 @@ def _main(args):
                 logger.info(f"Scan complete: {scanned}/{total_blocks_to_scan} blocks processed")
                 break
             
+            # Check auto-pause based on queue depth
+            check_auto_pause(db_manager)
+            
             # Report progress
             if time.time() - last_report > report_interval:
                 with blocks_scanned_lock:
@@ -1343,7 +1724,10 @@ def _main(args):
                 elapsed_str = format_time_dd_hh_mm_ss(elapsed)
                 current_block_number = start_block + scanned
                 progress_percent = (current_block_number / end_block * 100) if end_block > 0 else 0
-                logger.info(f"🐉 Progress: block {current_block_number}/{end_block} ({progress_percent:.1f}%). Elapsed: {elapsed_str}, ETA: {eta_str}, Speed: {speed_str}")
+                
+                # Add pause status indicator
+                pause_status = " ⏸️ PAUSED" if pause_event.is_set() else ""
+                logger.info(f"🐉 Progress: block {current_block_number}/{end_block} ({progress_percent:.1f}%). Elapsed: {elapsed_str}, ETA: {eta_str}, Speed: {speed_str}{pause_status}")
                 
                 # Update scan progress - current_block_number is the last block number processed
                 if current_block_number - last_progress_update >= 100:
@@ -1351,7 +1735,7 @@ def _main(args):
                     last_progress_update = current_block_number
                 
                 # Report performance stats
-                report_performance_stats(db_manager)
+                report_performance_stats(db_manager, worker_queues)
                 
                 if stop_event.is_set():
                     report_thread_status()
@@ -1361,32 +1745,81 @@ def _main(args):
             
             time.sleep(1)
         
-        # Signal workers to stop by adding sentinel values
-        logger.info("Signaling workers to stop...")
-        for worker_queue in worker_queues:
-            try:
-                worker_queue.put(None, block=False)  # Sentinel value
-            except queue.Full:
-                pass  # Queue is full, worker will eventually get the sentinel
+        # Graceful shutdown: Wait for workers to finish current blocks
+        logger.info("🔄 Starting graceful shutdown...")
         
-        # Wait for all threads to finish
-        logger.info("Waiting for threads to finish...")
+        # Step 1: Stop the distributor first (no new blocks to workers)
+        logger.info("Stopping distributor to prevent new blocks from being assigned...")
+        # The distributor will naturally stop when stop_event is set
         
-        # Wait for distributor thread
-        if distributor_thread.is_alive():
-            distributor_thread.join(timeout=10)
-            if distributor_thread.is_alive():
-                logger.warning("Distributor thread did not finish within timeout")
+        # Step 2: Wait for distributor to finish and workers to process their current queues
+        logger.info("Waiting for workers to process their current queue contents...")
+        max_wait_time = 300  # 5 minutes max wait
+        start_wait = time.time()
         
-        # Wait for worker threads
+        while time.time() - start_wait < max_wait_time:
+            # Check if distributor is done
+            if not distributor_thread.is_alive():
+                logger.info("Distributor has finished")
+            else:
+                logger.info("Distributor still running...")
+            
+            # Check worker queue depths
+            total_queued = sum(worker_queue.qsize() for worker_queue in worker_queues)
+            
+            # Check active workers
+            with active_workers_lock:
+                active_count = len(active_workers)
+                active_list = list(active_workers)
+            
+            if total_queued == 0 and active_count == 0 and not distributor_thread.is_alive():
+                logger.info("All work completed - no queued blocks, no active workers, distributor finished")
+                break
+            
+            logger.info(f"Waiting: {total_queued} queued blocks, {active_count} active workers: {active_list}")
+            time.sleep(5)
+        
+        # CRITICAL FIX: No need to send sentinel values - workers will naturally stop
+        # when their queues are empty and stop_event is set
+        logger.info("Workers will naturally stop when their queues are empty...")
+        
+        # Wait for all workers to finish (they will stop when queues are empty)
+        logger.info("Waiting for workers to finish processing their queues...")
+        max_wait_time = 300  # 5 minutes max wait
+        start_wait = time.time()
+        
+        while time.time() - start_wait < max_wait_time:
+            # Check if all workers are done
+            active_worker_threads = [t for t in worker_threads if t.is_alive()]
+            if not active_worker_threads:
+                logger.info("All workers finished processing their queues")
+                break
+            
+            # Log which workers are still active
+            active_names = [f"hydra-worker-{i}" for i, t in enumerate(worker_threads) if t.is_alive()]
+            logger.info(f"Waiting for {len(active_worker_threads)} workers to finish: {', '.join(active_names)}")
+            
+            # Wait a bit more
+            time.sleep(5)
+        
+        # Force timeout for any remaining workers
+        logger.info("Final worker cleanup...")
         for i, t in enumerate(worker_threads):
             if t.is_alive():
-                t.join(timeout=5)
+                logger.warning(f"Worker {i} still alive after timeout, forcing shutdown")
+                t.join(timeout=30)
                 if t.is_alive():
-                    logger.warning(f"Worker thread {i} did not finish within timeout")
+                    logger.error(f"Worker {i} could not be stopped")
         
         # Note: main_queue.join() removed - main queue is only used for distribution
         # Worker queues and thread joins handle the actual shutdown synchronization
+        
+        # CRITICAL: Final progress update before database shutdown
+        with blocks_scanned_lock:
+            final_scanned = total_blocks_scanned
+        final_block_number = start_block + final_scanned
+        logger.info(f"Final progress update: block {final_block_number} (scanned {final_scanned} blocks)")
+        update_scan_progress(db_manager.db_manager, final_block_number, final_scanned)
         
         # CRITICAL: Flush database queue before calculating final statistics
         logger.info("Flushing database queue to ensure all P2PK addresses are stored...")
@@ -1410,15 +1843,11 @@ def _main(args):
         else:
             logger.info(f"🐉 HYDRA MODE scan completed in {elapsed_str}!")
             logger.info(f"🔥 Performance: {blocks_per_second:.2f} blocks per second")
-            report_performance_stats(db_manager)
+            report_performance_stats(db_manager, worker_queues)
             report_thread_status()
-            
-            logger.info(f"🐉 Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned in {elapsed_str}")
-            logger.info(f"🔥 Average Speed: {blocks_per_second:.2f} blocks/second")
         
-        # Final progress update - final_block_number is the last block number processed
-        final_block_number = start_block + scanned
-        update_scan_progress(db_manager.db_manager, final_block_number, final_block_number - last_progress_update)
+        logger.info(f"🐉 Final Progress: {scanned}/{total_blocks_to_scan} blocks scanned in {elapsed_str}")
+        logger.info(f"🔥 Average Speed: {blocks_per_second:.2f} blocks/second")
         
         # Generate detailed performance profile (only for normal completion)
         if not was_graceful_exit:
@@ -1426,10 +1855,10 @@ def _main(args):
             
             # Report P2PK address integrity
             report_p2pk_integrity()
-            
-            # Report worker profiling if enabled
-            if args.worker_profile:
-                report_worker_profiling()
+        
+        # Report worker profiling if enabled
+        if args.worker_profile:
+            report_worker_profiling()
         
         # Final status - last block processed (always show)
         if was_graceful_exit:

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/krich/bitcoin/scanner/qdayscanner/venv/bin/python
 """
 Data Integrity Verification Script for P2PK Scanner Database
 

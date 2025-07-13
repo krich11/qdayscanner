@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/krich/bitcoin/scanner/qdayscanner/venv/bin/python
 """
 Block Verification and Repair Script for Bitcoin Quantum Vulnerability Scanner.
 Verifies that all blocks from the Bitcoin node are present in the database.
@@ -73,7 +73,7 @@ def get_database_block_range(db_manager: DatabaseManager) -> Tuple[int, int, int
 
 
 def get_database_blocks(db_manager: DatabaseManager, start_block: int, end_block: int) -> Set[int]:
-    """Get all block heights that should have been scanned within a range."""
+    """Get all block heights that actually exist in the database within a range."""
     try:
         # Get the actual scanned range from scan progress
         progress_query = """
@@ -87,19 +87,22 @@ def get_database_blocks(db_manager: DatabaseManager, start_block: int, end_block
         
         if progress_result and progress_result[0]['last_scanned_block']:
             last_scanned = progress_result[0]['last_scanned_block']
-            # Return all blocks from start_block to the last actually scanned block
-            # This represents blocks that should have been processed
-            return set(range(start_block, min(end_block, last_scanned + 1)))
-        else:
-            # Fallback: return blocks that actually have P2PK transactions
-            query = """
-            SELECT DISTINCT block_height 
-            FROM p2pk_transactions 
-            WHERE block_height BETWEEN %s AND %s 
-            ORDER BY block_height
-            """
-            results = db_manager.execute_query(query, (start_block, end_block))
-            return {row['block_height'] for row in results}
+            # Only check up to the last actually scanned block
+            end_block = min(end_block, last_scanned)
+        
+        # Get blocks that actually exist in the database (have been processed)
+        # Check both p2pk_transactions and p2pk_address_blocks tables
+        query = """
+        SELECT DISTINCT block_height 
+        FROM (
+            SELECT block_height FROM p2pk_transactions WHERE block_height BETWEEN %s AND %s
+            UNION
+            SELECT block_height FROM p2pk_address_blocks WHERE block_height BETWEEN %s AND %s
+        ) combined_blocks
+        ORDER BY block_height
+        """
+        results = db_manager.execute_query(query, (start_block, end_block, start_block, end_block))
+        return {row['block_height'] for row in results}
     except Exception as e:
         logger.error(f"Failed to get database blocks: {e}")
         return set()
@@ -115,7 +118,7 @@ def find_missing_blocks(bitcoin_blocks: Set[int], database_blocks: Set[int], db_
     try:
         # Get the actual last scanned block from scan progress
         progress_query = """
-        SELECT last_scanned_block
+        SELECT last_scanned_block, total_blocks_scanned
         FROM scan_progress 
         WHERE scanner_name = 'hydra_mode_p2pk_scanner'
         ORDER BY last_scanned_block DESC
@@ -128,35 +131,37 @@ def find_missing_blocks(bitcoin_blocks: Set[int], database_blocks: Set[int], db_
             return sorted(list(bitcoin_blocks - database_blocks))
         
         last_scanned = progress_result[0]['last_scanned_block']
+        total_scanned = progress_result[0]['total_blocks_scanned']
         
-        # Only report blocks as missing if they were within the scanned range
-        missing = []
-        for block in sorted(bitcoin_blocks):
-            if block > last_scanned:
-                # This block hasn't been scanned yet, so it's not missing
-                continue
-            elif block not in database_blocks:
-                # This block should have been scanned but has no P2PK transactions
-                # Check if it was actually processed by looking for any transaction records
-                check_query = """
-                SELECT COUNT(*) as count
-                FROM p2pk_transactions 
-                WHERE block_height = %s
-                """
-                check_result = db_manager.execute_query(check_query, (block,))
-                if check_result and check_result[0]['count'] == 0:
-                    # Block was scanned but has no P2PK transactions - this is normal
+        # Calculate the expected number of blocks that should have been processed
+        # The scanner processes blocks sequentially, so if last_scanned is 800000,
+        # it should have processed blocks 0 through 800000 (800001 total blocks)
+        expected_processed_blocks = last_scanned + 1
+        
+        # If the total_blocks_scanned matches expected, then all blocks were processed
+        # and any missing blocks are just blocks with no P2PK transactions
+        if total_scanned == expected_processed_blocks:
+            # All blocks were processed, so no true gaps
+            return []
+        else:
+            # There are true gaps - blocks that were never processed
+            # Calculate which blocks are missing
+            missing = []
+            for block in sorted(bitcoin_blocks):
+                if block > last_scanned:
+                    # This block hasn't been scanned yet, so it's not missing
                     continue
-                else:
-                    # Block was not scanned at all - this is missing
+                elif block not in database_blocks:
+                    # This block should have been scanned but is missing from database
+                    # This indicates a gap in the scanning process
                     missing.append(block)
-        
-        return missing
+            
+            return missing
         
     except Exception as e:
         logger.error(f"Failed to find missing blocks: {e}")
         # Fall back to simple difference
-        return sorted(list(bitcoin_blocks - database_blocks))
+    return sorted(list(bitcoin_blocks - database_blocks))
 
 
 def find_extra_blocks(bitcoin_blocks: Set[int], database_blocks: Set[int]) -> List[int]:
